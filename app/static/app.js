@@ -3,7 +3,12 @@
 
 const state = {
   planId: null,
+  // 展示中的结果：{ key, data }。key 为求解时刻的输入指纹，
+  // 仅当 key 与当前输入指纹一致时结果才属于当前页面，否则一律撤下。
   result: null,
+  // 求解请求序号：每次求解与每次方案切换（新建/打开/删除当前方案）都递增，
+  // 响应回来时序号不匹配即为过期请求，静默丢弃。
+  solveSeq: 0,
   planMenuOpen: false,
 };
 
@@ -86,6 +91,7 @@ function renderMics() {
 
     card.querySelector('[data-k="id"]').addEventListener("input", (e) => {
       mic.id = e.target.value.trim();
+      onPlanEdited();
     });
 
     card.querySelector('[data-k="locked"]').addEventListener("change", (e) => {
@@ -95,6 +101,7 @@ function renderMics() {
         mic.current = Math.min(...mic.candidates);
         renderMics();
       }
+      onPlanEdited();
     });
 
     const candArea = card.querySelector('[data-k="candidates"]');
@@ -105,16 +112,19 @@ function renderMics() {
         mic.current = null;
       }
       renderMics();
+      onPlanEdited();
     });
 
     card.querySelector('[data-k="current"]').addEventListener("change", (e) => {
       mic.current = e.target.value === "" ? null : parseInt(e.target.value, 10);
+      onPlanEdited();
     });
 
     card.querySelector('[data-act="del"]').addEventListener("click", () => {
       if (plan.mics.length <= 2) return;
       plan.mics.splice(idx, 1);
       renderMics();
+      onPlanEdited();
     });
 
     wrap.appendChild(card);
@@ -154,13 +164,16 @@ function renderBands() {
     const [lo, hi] = chip.querySelectorAll("input");
     lo.addEventListener("change", () => {
       plan.forbidden[idx].low = parseInt(lo.value, 10);
+      onPlanEdited();
     });
     hi.addEventListener("change", () => {
       plan.forbidden[idx].high = parseInt(hi.value, 10);
+      onPlanEdited();
     });
     chip.querySelector('[data-act="delband"]').addEventListener("click", () => {
       plan.forbidden.splice(idx, 1);
       renderBands();
+      onPlanEdited();
     });
     wrap.appendChild(chip);
   });
@@ -174,6 +187,63 @@ function collectPlan() {
   plan.imTolerance = parseInt($("#imTolerance").value, 10);
   plan.timeLimit = parseInt($("#timeLimit").value, 10);
   return plan;
+}
+
+// --------------------------- 结果归属规则 ---------------------------
+//
+// 结果只属于“产生它的那份输入”：
+//   * 求解时记录输入指纹 reqKey 与请求序号 reqId；
+//   * 响应（无论成功/失败）回来时，reqId 仍是最新且当前输入指纹仍等于
+//     reqKey，结果才允许上屏，否则静默丢弃；
+//   * 任何输入变动都会改变指纹，onPlanEdited() 立即撤下失效结果；
+//   * 新建/打开/删除当前方案会递增 solveSeq 并清空结果，在途的旧请求
+//     响应随之全部过期。
+// 指纹只含影响求解与展示的字段（方案名称不影响协调结果，不计入）。
+
+function planFingerprint() {
+  collectPlan();
+  const norm = {
+    minGap: plan.minGap,
+    imTolerance: plan.imTolerance,
+    timeLimit: plan.timeLimit,
+    forbidden: plan.forbidden
+      .map((b) => [b.low, b.high])
+      .sort((x, y) => x[0] - y[0] || x[1] - y[1]),
+    mics: plan.mics.map((m) => [
+      m.id,
+      [...m.candidates].sort((a, b) => a - b),
+      m.current,
+      m.locked,
+    ]),
+  };
+  return JSON.stringify(norm);
+}
+
+function invalidateResult() {
+  state.result = null;
+  $("#resultPanel").hidden = true;
+  clearCanvas();
+}
+
+// 任何编辑动作后调用：展示中的结果若不再对应当前输入，立即撤下。
+function onPlanEdited() {
+  if (state.result && state.result.key !== planFingerprint()) {
+    invalidateResult();
+  }
+}
+
+function setSolveBusy(busy) {
+  const btn = $("#btnSolve");
+  btn.disabled = busy;
+  btn.textContent = busy ? "求解中…" : "▶ 协调求解";
+}
+
+// 方案上下文切换（新建/打开/删除当前方案）：
+// 作废旧求解请求、撤下旧结果、复位求解按钮。
+function switchPlanContext() {
+  state.solveSeq++;
+  invalidateResult();
+  setSolveBusy(false);
 }
 
 function validatePlan(p) {
@@ -220,26 +290,33 @@ async function solvePlan() {
     toast(errs[0] + (errs.length > 1 ? ` 等 ${errs.length} 项错误` : ""), true);
     return;
   }
-  const btn = $("#btnSolve");
-  btn.disabled = true;
-  btn.textContent = "求解中…";
+  const reqId = ++state.solveSeq;
+  const reqKey = planFingerprint();
+  const payload = toApiPayload(plan);
+  // 归属判定：仍是最后一次求解、且输入自提交起未变，响应才属于当前页面
+  const isCurrent = () =>
+    reqId === state.solveSeq && reqKey === planFingerprint();
+  setSolveBusy(true);
   try {
     const resp = await fetch("/api/solve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(toApiPayload(plan)),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) {
       const detail = await resp.json().catch(() => ({}));
       throw new Error(detail.detail || `HTTP ${resp.status}`);
     }
-    state.result = await resp.json();
-    renderResult(state.result);
+    const data = await resp.json();
+    if (!isCurrent()) return; // 过期成功响应：不得重现结果
+    state.result = { key: reqKey, data };
+    renderResult(data);
   } catch (e) {
+    if (!isCurrent()) return; // 过期失败响应：不得报错
     toast("求解失败：" + e.message, true);
   } finally {
-    btn.disabled = false;
-    btn.textContent = "▶ 协调求解";
+    // 仅在仍是当前请求时复位按钮；过期请求的收尾不得干扰新上下文
+    if (reqId === state.solveSeq) setSolveBusy(false);
   }
 }
 
@@ -607,9 +684,8 @@ async function loadPlan(id) {
       })),
     };
     state.planId = rec.id;
-    state.result = null;
+    switchPlanContext();
     syncFormFromPlan();
-    $("#resultPanel").hidden = true;
     $("#planMenu").hidden = true;
     state.planMenuOpen = false;
     toast(`已打开方案「${rec.name}」`);
@@ -626,7 +702,7 @@ async function deletePlan(id) {
     return;
   }
   if (state.planId === id) newPlan(false);
-  await refreshPlanMenu();
+  await renderPlanMenu();
   toast("方案已删除");
 }
 
@@ -643,9 +719,8 @@ function newPlan(confirmFlag = true) {
   if (confirmFlag && !confirm("新建将清空当前未保存的编辑，确定？")) return;
   plan = defaultPlan();
   state.planId = null;
-  state.result = null;
+  switchPlanContext();
   syncFormFromPlan();
-  $("#resultPanel").hidden = true;
 }
 
 // --------------------------- 初始化 ---------------------------
@@ -654,9 +729,18 @@ function init() {
   renderBands();
   renderMics();
 
-  $("#minGap").addEventListener("change", collectPlan);
-  $("#imTolerance").addEventListener("change", collectPlan);
-  $("#timeLimit").addEventListener("change", collectPlan);
+  $("#minGap").addEventListener("input", () => {
+    collectPlan();
+    onPlanEdited();
+  });
+  $("#imTolerance").addEventListener("input", () => {
+    collectPlan();
+    onPlanEdited();
+  });
+  $("#timeLimit").addEventListener("input", () => {
+    collectPlan();
+    onPlanEdited();
+  });
   $("#btnAddBand").addEventListener("click", () => {
     collectPlan();
     const base = plan.forbidden.length
@@ -664,6 +748,7 @@ function init() {
       : 500;
     plan.forbidden.push({ low: base, high: base + 10 });
     renderBands();
+    onPlanEdited();
   });
   $("#btnAddMic").addEventListener("click", () => {
     collectPlan();
@@ -678,6 +763,7 @@ function init() {
     }
     plan.mics.push(blankMic(id));
     renderMics();
+    onPlanEdited();
   });
   $("#btnSolve").addEventListener("click", solvePlan);
   $("#btnSave").addEventListener("click", savePlan);
@@ -692,7 +778,9 @@ function init() {
     }
   });
   window.addEventListener("resize", () => {
-    if (state.result) drawSpectrum(plan, state.result);
+    // 缩放只重绘仍属于当前输入的结果；指纹不匹配时先撤下，避免新旧混绘
+    onPlanEdited();
+    if (state.result) drawSpectrum(plan, state.result.data);
   });
 }
 
