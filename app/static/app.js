@@ -1,9 +1,23 @@
-/* 无线话筒频点协调台 —— 原生 JS 前端 */
+/* 无线话筒频点协调台 —— 原生 JS 前端
+ *
+ * 结果归属规则（只展示属于“当前方案当前输入”的结果）：
+ *   - state.viewId       方案视图代号：新建 / 打开另一方案时递增；
+ *   - state.inputVersion 输入版本号：任何影响求解的输入变动时递增；
+ *   - 每次 /api/solve 携带发起时的 viewId / inputVersion / seq，响应回来后
+ *     三者必须仍与当前状态一致才允许呈现，否则一律静默丢弃（成功不重现、
+ *     失败不报错）；进行中的过期请求用 AbortController 主动中止；
+ *   - 输入变动立即递增版本号、中止在途请求并撤下结果表格与频谱；
+ *   - 保存方案不改动输入版本号，未改输入的保存不会撤下有效结果。
+ */
 "use strict";
 
 const state = {
   planId: null,
-  result: null,
+  viewId: 0, // 新建/打开方案时递增
+  inputVersion: 0, // 影响求解的输入每次变动递增
+  result: null, // { viewId, inputVersion, data }
+  solveSeq: 0, // 已发起的求解请求序号
+  solveAbort: null, // 当前在途请求的 AbortController
   planMenuOpen: false,
 };
 
@@ -40,6 +54,64 @@ function blankMic(id) {
 }
 
 let plan = defaultPlan();
+
+// --------------------------- 结果归属管理 ---------------------------
+
+function abortPendingSolve() {
+  if (state.solveAbort) {
+    state.solveAbort.abort();
+    state.solveAbort = null;
+  }
+}
+
+function hideResultPanel() {
+  $("#resultPanel").hidden = true;
+  $("#statusBanner").className = "banner";
+  $("#statusBanner").innerHTML = "";
+  $("#conflicts").innerHTML = "";
+  $("#resultSummary").innerHTML = "";
+  $("#resultTable").innerHTML = "";
+  $("#phaseLog").textContent = "";
+  const cv = $("#spectrum");
+  cv.style.height = "";
+  cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+}
+
+/**
+ * 切换方案视图（新建 / 打开另一方案）：旧视图的在途求解即刻过期，
+ * 旧结果立即撤下，任何迟到响应都无法再回填本页面。
+ */
+function beginView() {
+  state.viewId += 1;
+  state.inputVersion = 0;
+  state.result = null;
+  abortPendingSolve();
+  hideResultPanel();
+}
+
+/**
+ * 影响求解的输入发生变动：旧结果对当前输入失效，立即撤下表格与频谱，
+ * 并中止在途求解（其成功/失败响应随后静默丢弃）。
+ */
+function noteInputChanged() {
+  state.inputVersion += 1;
+  state.result = null;
+  abortPendingSolve();
+  hideResultPanel();
+}
+
+/** 仅当结果属于当前方案视图、且属于当前输入版本时才有效。 */
+function currentResult() {
+  const r = state.result;
+  if (
+    r &&
+    r.viewId === state.viewId &&
+    r.inputVersion === state.inputVersion
+  ) {
+    return r.data;
+  }
+  return null;
+}
 
 // --------------------------- 渲染：话筒卡片 ---------------------------
 
@@ -86,6 +158,7 @@ function renderMics() {
 
     card.querySelector('[data-k="id"]').addEventListener("input", (e) => {
       mic.id = e.target.value.trim();
+      noteInputChanged();
     });
 
     card.querySelector('[data-k="locked"]').addEventListener("change", (e) => {
@@ -95,9 +168,12 @@ function renderMics() {
         mic.current = Math.min(...mic.candidates);
         renderMics();
       }
+      noteInputChanged();
     });
 
     const candArea = card.querySelector('[data-k="candidates"]');
+    // 敲入即刻令旧结果失效；失焦时完成解析与卡片重建
+    candArea.addEventListener("input", noteInputChanged);
     candArea.addEventListener("change", () => {
       const parsed = parseCandidates(candArea.value);
       mic.candidates = parsed.values;
@@ -105,16 +181,19 @@ function renderMics() {
         mic.current = null;
       }
       renderMics();
+      noteInputChanged();
     });
 
     card.querySelector('[data-k="current"]').addEventListener("change", (e) => {
       mic.current = e.target.value === "" ? null : parseInt(e.target.value, 10);
+      noteInputChanged();
     });
 
     card.querySelector('[data-act="del"]').addEventListener("click", () => {
       if (plan.mics.length <= 2) return;
       plan.mics.splice(idx, 1);
       renderMics();
+      noteInputChanged();
     });
 
     wrap.appendChild(card);
@@ -152,15 +231,20 @@ function renderBands() {
       <span>kHz</span>
       <button class="btn btn-small btn-danger" data-act="delband">×</button>`;
     const [lo, hi] = chip.querySelectorAll("input");
+    lo.addEventListener("input", noteInputChanged);
     lo.addEventListener("change", () => {
       plan.forbidden[idx].low = parseInt(lo.value, 10);
+      noteInputChanged();
     });
+    hi.addEventListener("input", noteInputChanged);
     hi.addEventListener("change", () => {
       plan.forbidden[idx].high = parseInt(hi.value, 10);
+      noteInputChanged();
     });
     chip.querySelector('[data-act="delband"]').addEventListener("click", () => {
       plan.forbidden.splice(idx, 1);
       renderBands();
+      noteInputChanged();
     });
     wrap.appendChild(chip);
   });
@@ -220,26 +304,53 @@ async function solvePlan() {
     toast(errs[0] + (errs.length > 1 ? ` 等 ${errs.length} 项错误` : ""), true);
     return;
   }
+
+  // 发起前先中止任何残留的在途请求（正常情况下按钮禁用，并无并发）
+  abortPendingSolve();
+
+  // 记录本次请求的归属：只有三者始终未变，响应才允许呈现
+  const viewId = state.viewId;
+  const inputVersion = state.inputVersion;
+  const seq = ++state.solveSeq;
+  const controller = new AbortController();
+  state.solveAbort = controller;
+
   const btn = $("#btnSolve");
   btn.disabled = true;
   btn.textContent = "求解中…";
+
+  const isStale = () =>
+    state.viewId !== viewId ||
+    state.inputVersion !== inputVersion ||
+    state.solveSeq !== seq;
+
   try {
     const resp = await fetch("/api/solve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(toApiPayload(plan)),
+      signal: controller.signal,
     });
     if (!resp.ok) {
       const detail = await resp.json().catch(() => ({}));
       throw new Error(detail.detail || `HTTP ${resp.status}`);
     }
-    state.result = await resp.json();
-    renderResult(state.result);
+    const data = await resp.json();
+    // 过期成功响应：静默丢弃，不得回填当前页面
+    if (isStale()) return;
+    state.result = { viewId, inputVersion, data };
+    renderResult(data);
   } catch (e) {
+    // 被中止或已过期的失败响应：静默丢弃，不弹错误
+    if (e.name === "AbortError" || isStale()) return;
     toast("求解失败：" + e.message, true);
   } finally {
-    btn.disabled = false;
-    btn.textContent = "▶ 协调求解";
+    // 仅最新一次请求有权恢复按钮，避免旧请求提前解锁
+    if (state.solveSeq === seq) {
+      state.solveAbort = null;
+      btn.disabled = false;
+      btn.textContent = "▶ 协调求解";
+    }
   }
 }
 
@@ -345,6 +456,7 @@ function renderResult(r) {
 
 function clearCanvas() {
   const cv = $("#spectrum");
+  cv.style.height = "";
   cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
 }
 
@@ -515,6 +627,7 @@ async function savePlan() {
     return;
   }
   const payload = toApiPayload(plan);
+  // 保存不触碰 inputVersion / state.result：输入未变时有效结果原样保留
   try {
     let resp;
     if (state.planId) {
@@ -588,10 +701,22 @@ async function togglePlanMenu() {
 }
 
 async function loadPlan(id) {
+  // 立即切换归属：在途求解与旧结果即刻失效，迟到响应无法回填
+  const viewId = state.viewId + 1;
+  state.viewId = viewId;
+  state.inputVersion = 0;
+  state.result = null;
+  abortPendingSolve();
+  hideResultPanel();
+  const menu = $("#planMenu");
+  menu.hidden = true;
+  state.planMenuOpen = false;
+
   try {
     const resp = await fetch(`/api/plans/${id}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const rec = await resp.json();
+    if (state.viewId !== viewId) return; // 期间又新建/打开了别的方案
     const d = rec.plan;
     plan = {
       name: d.name,
@@ -607,13 +732,10 @@ async function loadPlan(id) {
       })),
     };
     state.planId = rec.id;
-    state.result = null;
     syncFormFromPlan();
-    $("#resultPanel").hidden = true;
-    $("#planMenu").hidden = true;
-    state.planMenuOpen = false;
     toast(`已打开方案「${rec.name}」`);
   } catch (e) {
+    if (state.viewId !== viewId) return;
     toast("打开失败：" + e.message, true);
   }
 }
@@ -630,6 +752,10 @@ async function deletePlan(id) {
   toast("方案已删除");
 }
 
+async function refreshPlanMenu() {
+  if (state.planMenuOpen) await renderPlanMenu();
+}
+
 function syncFormFromPlan() {
   $("#planName").value = plan.name;
   $("#minGap").value = plan.minGap;
@@ -641,11 +767,10 @@ function syncFormFromPlan() {
 
 function newPlan(confirmFlag = true) {
   if (confirmFlag && !confirm("新建将清空当前未保存的编辑，确定？")) return;
+  beginView();
   plan = defaultPlan();
   state.planId = null;
-  state.result = null;
   syncFormFromPlan();
-  $("#resultPanel").hidden = true;
 }
 
 // --------------------------- 初始化 ---------------------------
@@ -654,9 +779,15 @@ function init() {
   renderBands();
   renderMics();
 
-  $("#minGap").addEventListener("change", collectPlan);
-  $("#imTolerance").addEventListener("change", collectPlan);
-  $("#timeLimit").addEventListener("change", collectPlan);
+  // 全局参数变动：同步数值并立即令旧结果失效（方案名称不影响求解，不纳入）
+  const onGlobalInput = () => {
+    collectPlan();
+    noteInputChanged();
+  };
+  $("#minGap").addEventListener("input", onGlobalInput);
+  $("#imTolerance").addEventListener("input", onGlobalInput);
+  $("#timeLimit").addEventListener("input", onGlobalInput);
+
   $("#btnAddBand").addEventListener("click", () => {
     collectPlan();
     const base = plan.forbidden.length
@@ -664,6 +795,7 @@ function init() {
       : 500;
     plan.forbidden.push({ low: base, high: base + 10 });
     renderBands();
+    noteInputChanged();
   });
   $("#btnAddMic").addEventListener("click", () => {
     collectPlan();
@@ -678,6 +810,7 @@ function init() {
     }
     plan.mics.push(blankMic(id));
     renderMics();
+    noteInputChanged();
   });
   $("#btnSolve").addEventListener("click", solvePlan);
   $("#btnSave").addEventListener("click", savePlan);
@@ -691,8 +824,12 @@ function init() {
       state.planMenuOpen = false;
     }
   });
+  // 仅在结果仍属于当前方案当前输入、且面板可见时重绘，
+  // 绝不让新输入与旧解同屏；冲突结果无分配数据，不绘制频谱
   window.addEventListener("resize", () => {
-    if (state.result) drawSpectrum(plan, state.result);
+    if ($("#resultPanel").hidden) return;
+    const r = currentResult();
+    if (r && r.status !== "conflict") drawSpectrum(plan, r);
   });
 }
 
